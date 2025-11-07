@@ -30,7 +30,7 @@
 # Notes
 #   - Video chain per segment: settb=AVTB -> setpts=PTS-STARTPTS
 #                             -> scale=WxH:force_original_aspect_ratio=decrease
-#                             -> pad=W:H:center -> fps -> format=yuv420p
+#                             -> pad=W:H:center -> setsar=1 -> fps -> format=yuv420p
 #   - Audio chain per segment (if enabled): asetpts=PTS-STARTPTS -> aformat -> aresample(48k)
 #   - If any input lacks audio while --unmute is set, script falls back to video-only concat.
 # -----------------------------------------------------------------------------
@@ -140,8 +140,8 @@ vlabels=()
 alabels=()
 
 for i in "${!mp4_files[@]}"; do
-  # Video chain: reset TB/PTS -> scale to fit -> pad to exact -> fps -> format
-  filter_parts+=( "[$i:v]settb=AVTB,setpts=PTS-STARTPTS,scale=${first_w}:${first_h}:force_original_aspect_ratio=decrease,pad=${first_w}:${first_h}:((ow-iw)/2):((oh-ih)/2):color=black,fps=fps=${out_fps},format=yuv420p[v$i]" )
+  # Video chain: reset TB/PTS -> scale to fit -> pad to exact -> setsar=1 -> fps -> format
+  filter_parts+=( "[$i:v]settb=AVTB,setpts=PTS-STARTPTS,scale=${first_w}:${first_h}:force_original_aspect_ratio=decrease,pad=${first_w}:${first_h}:((ow-iw)/2):((oh-ih)/2):color=black,setsar=1,fps=fps=${out_fps},format=yuv420p[v$i]" )
   vlabels+=( "[v$i]" )
   if (( enable_audio_concat == 1 )); then
     # Audio chain: reset PTS -> format stereo/float -> resample 48k (uniform for concat)
