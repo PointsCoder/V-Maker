@@ -10,11 +10,12 @@ All tools are self-contained, dependency-minimal, and rigorously documented — 
 - **bash** ≥ 4.0  
 - **ffmpeg** ≥ 4.2  
 - **ffprobe** (for scripts that probe metadata)
+- **imagemagick**
 
 Install on Linux/macOS:
 
     sudo apt install ffmpeg
-
+    sudo apt-get install imagemagick
 ---
 
 ## 🧩 Included Tools
@@ -27,6 +28,7 @@ Install on Linux/macOS:
 | [`mp4trim.sh`](#mp4trimsh) | Trim videos by start/end or duration (copy or re-encode). |
 | [`mp4speed.sh`](#mp4speedsh) | Speed up or slow down video + audio by any factor. |
 | [`mp4flip.sh`](#mp4flipsh) | Flip videos horizontally, vertically, or both. |
+| [`mp4frame.sh`](#mp4framesh) | Extract frames from videos as images. |
 | [`webm2mp4.sh`](#webm2mp4sh) | Convert WEBM → MP4 (H.264 + AAC). |
 | [`png2jpg.sh`](#png2jpgsh) | Convert PNG → JPG with configurable quality. |
 

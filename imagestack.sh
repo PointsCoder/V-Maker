@@ -1,42 +1,33 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# imgstack.sh — Spatially stack many images into an N×M grid using ffmpeg
+# imagestackn.sh — Stack images into an N×M grid (tight/contain/cover) using ffmpeg
 #
-# Features
-#   - Input is a folder (sorted by filename). Supports both `-i DIR` and a
-#     positional DIR argument (e.g., `imgstack.sh -n 2 -m 3 ./images`).
-#   - Arrange images into an N×M grid (row-major): top-left to bottom-right.
-#   - Per-cell resize with aspect-ratio preserved, two fit modes:
-#       * contain (default): letterbox pad to cell size (no crop, may show borders)
-#       * cover            : center-crop to fill cell (no borders, may crop edges)
-#   - Cell size:
-#       * Default 640×360.
-#       * If user did NOT set --cell-width/--cell-height, the script auto-detects
-#         from the FIRST image’s native resolution.
-#   - Output: a single PNG image, named grid_{ROWS}x{COLS}.png by default.
-#   - Robust filename handling (spaces/UTF-8) via -print0.
-#   - Requires: ffmpeg
+# Highlights
+#   - New "tight" mode: compute canvas from the ORIGINAL image sizes (no scaling),
+#     then place images row-major with optional horizontal alignment per row.
+#   - "contain"/"cover" modes keep existing behavior with per-cell resizing.
+#   - Background color: white / black / transparent / #RRGGBB (e.g., "#202020").
+#   - Robust size probing: ffprobe -> (fallback) ImageMagick identify.
 #
 # Usage
-#   imgstack.sh -n ROWS -m COLS [-i INPUT_DIR | INPUT_DIR]
-#               [-o OUTPUT_PNG]
-#               [--cell-width W] [--cell-height H]
-#               [--fit-mode contain|cover]
-#               [--exts "png,jpg,jpeg,webp"] [--limit K]
-#               [--quiet]
+#   imagestackn.sh -n ROWS -m COLS [-i INPUT_DIR | INPUT_DIR]
+#                  [-o OUTPUT_PNG]
+#                  [--fit-mode tight|contain|cover]
+#                  [--cell-width W] [--cell-height H]         # for contain/cover
+#                  [--gutter PX] [--align left|center|right]  # tight/contain/cover
+#                  [--exts "png,jpg,jpeg,webp"] [--limit K]
+#                  [--bg-color white|black|transparent|#RRGGBB]
+#                  [--quiet]
 #
 # Examples
-#   # 1) 2×4 grid, default contain mode
-#   ./imgstack.sh -n 2 -m 4 "/path/to/image_folder"
+#   # Tight canvas from native sizes, 2 rows × 1 col, no gaps, white bg
+#   ./imagestackn.sh -n 2 -m 1 ./imgs --fit-mode tight --gutter 0 --bg-color white
 #
-#   # 2) 3×2 grid, cover mode (fill by cropping), cell auto from first image
-#   ./imgstack.sh -n 3 -m 2 ./imgs --fit-mode cover
+#   # Same but transparent background
+#   ./imagestackn.sh -n 2 -m 1 ./imgs --fit-mode tight --bg-color transparent
 #
-#   # 3) Manually set cell size to 512×512 and custom output file
-#   ./imgstack.sh -n 2 -m 3 ./imgs --cell-width 512 --cell-height 512 -o out/grid.png
-#
-#   # 4) Only use the first 6 images (row-major fill)
-#   ./imgstack.sh -n 2 -m 3 ./imgs --limit 6
+#   # Fixed cells 5120×756, cover (no borders, may crop), centered rows
+#   ./imagestackn.sh -n 2 -m 1 ./imgs --fit-mode cover --cell-width 5120 --cell-height 756 --align center
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -48,14 +39,16 @@ rows=""
 cols=""
 input_dir=""
 output_png=""
-cell_w=640
+fit_mode="tight"          # tight | contain | cover
+cell_w=640                  # used in contain/cover
 cell_h=360
-fit_mode="contain"          # contain | cover
 exts="png,jpg,jpeg,webp"
 limit=""                    # default: N*M
+gutter=0
+align="left"                # left | center | right (per row)
+bg_color="transparent"            # black | white | transparent | #RRGGBB
 verbose=1
 
-# Track whether user explicitly set cell size (for auto-detect behavior)
 user_set_cell_w=0
 user_set_cell_h=0
 
@@ -67,11 +60,14 @@ while [[ $# -gt 0 ]]; do
     -m|--cols)        cols="${2:?}"; shift 2 ;;
     -i|--input-dir)   input_dir="${2:?}"; shift 2 ;;
     -o|--output)      output_png="${2:?}"; shift 2 ;;
+    --fit-mode)       fit_mode="${2:?}"; shift 2 ;;
     --cell-width)     cell_w="${2:?}"; user_set_cell_w=1; shift 2 ;;
     --cell-height)    cell_h="${2:?}"; user_set_cell_h=1; shift 2 ;;
-    --fit-mode)       fit_mode="${2:?}"; shift 2 ;;
     --exts)           exts="${2:?}"; shift 2 ;;
     --limit)          limit="${2:?}"; shift 2 ;;
+    --gutter)         gutter="${2:?}"; shift 2 ;;
+    --align)          align="${2:?}"; shift 2 ;;
+    --bg-color)       bg_color="${2:?}"; shift 2 ;;
     --quiet)          verbose=0; shift ;;
     -h|--help)        print_usage 0 ;;
     -*)
@@ -81,13 +77,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# If -i not provided, accept a single positional directory
+# Derive input_dir from positional
 if [[ -z "$input_dir" ]]; then
-  if [[ ${#positional_dirs[@]} -eq 1 ]]; then
-    input_dir="${positional_dirs[0]}"
+  if   [[ ${#positional_dirs[@]} -eq 1 ]]; then input_dir="${positional_dirs[0]}"
   elif [[ ${#positional_dirs[@]} -gt 1 ]]; then
-    echo "Error: multiple positional directories provided; use -i/--input-dir." >&2
-    exit 1
+    echo "Error: multiple positional directories provided; use -i/--input-dir." >&2; exit 1
   fi
 fi
 
@@ -95,26 +89,19 @@ fi
 [[ -n "$rows" && "$rows" =~ ^[0-9]+$ && "$rows" -ge 1 ]] || { echo "Error: --rows must be >=1." >&2; exit 1; }
 [[ -n "$cols" && "$cols" =~ ^[0-9]+$ && "$cols" -ge 1 ]] || { echo "Error: --cols must be >=1." >&2; exit 1; }
 [[ -n "$input_dir" && -d "$input_dir" ]] || { echo "Error: INPUT_DIR must be an existing directory." >&2; exit 1; }
-case "$fit_mode" in contain|cover) ;; *) echo "Error: --fit-mode must be contain|cover." >&2; exit 1 ;; esac
-[[ "$cell_w" =~ ^[0-9]+$ && "$cell_w" -ge 2 ]] || { echo "Error: --cell-width invalid." >&2; exit 1; }
-[[ "$cell_h" =~ ^[0-9]+$ && "$cell_h" -ge 2 ]] || { echo "Error: --cell-height invalid." >&2; exit 1; }
-
+case "$fit_mode" in tight|contain|cover) ;; *) echo "Error: --fit-mode must be tight|contain|cover." >&2; exit 1 ;; esac
+[[ "$cell_w" =~ ^[0-9]+$ && "$cell_w" -ge 2 ]] || true
+[[ "$cell_h" =~ ^[0-9]+$ && "$cell_h" -ge 2 ]] || true
+[[ "$gutter" =~ ^[0-9]+$ && "$gutter" -ge 0 ]] || { echo "Error: --gutter must be >=0." >&2; exit 1; }
+case "$align" in left|center|right) ;; *) echo "Error: --align must be left|center|right." >&2; exit 1 ;; esac
 command -v ffmpeg  >/dev/null 2>&1 || { echo "Error: ffmpeg not found in PATH." >&2; exit 1; }
 
-# Compute default output path
+# Output path default
 if [[ -z "$output_png" ]]; then
   output_png="${input_dir%/}/grid_${rows}x${cols}.png"
 fi
 
-# Max inputs default
-grid_cap=$((rows * cols))
-if [[ -z "$limit" ]]; then
-  limit="$grid_cap"
-fi
-[[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 ]] || { echo "Error: --limit invalid." >&2; exit 1; }
-
-# ------------------------------ Gather files (robust) ------------------------
-# Build case-insensitive predicates for extensions
+# Ext filter
 IFS=',' read -r -a ext_arr <<< "$exts"
 pred=""
 for e in "${ext_arr[@]}"; do
@@ -126,103 +113,191 @@ for e in "${ext_arr[@]}"; do
   fi
 done
 
-# Read file names safely with NUL separators (handles spaces/UTF-8 correctly)
+# Gather files
 files=()
-while IFS= read -r -d '' f; do
-  files+=("$f")
-done < <(eval "find \"\$input_dir\" -maxdepth 1 -type f \( $pred \) -print0 | sort -z")
+while IFS= read -r -d '' f; do files+=("$f"); done \
+  < <(eval "find \"\$input_dir\" -maxdepth 1 -type f \( $pred \) -print0 | sort -z")
 
-if (( ${#files[@]} == 0 )); then
-  echo "No input images found in: $input_dir (exts: $exts)" >&2
-  exit 1
-fi
-if (( ${#files[@]} > limit )); then
-  files=( "${files[@]:0:limit}" )
-fi
+(( ${#files[@]} > 0 )) || { echo "No input images found in: $input_dir (exts: $exts)" >&2; exit 1; }
+
+grid_cap=$((rows * cols))
+if [[ -z "$limit" ]]; then limit="$grid_cap"; fi
+[[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 ]] || { echo "Error: --limit invalid." >&2; exit 1; }
+if (( ${#files[@]} > limit )); then files=( "${files[@]:0:limit}" ); fi
 inputs_count=${#files[@]}
 
-# ------------------------------ Auto cell size -------------------------------
-# If user did NOT explicitly set cell size, adopt FIRST image’s native size.
-if (( user_set_cell_w == 0 || user_set_cell_h == 0 )); then
-  # Use ffmpeg to probe width/height; images are supported by demuxers.
-  first_w=$(ffmpeg -v error -i "${files[0]}" -f null - 2>&1 | awk -F'[, ]+' '/, [0-9]+x[0-9]+/ { for(i=1;i<=NF;i++) if ($i ~ /[0-9]+x[0-9]+/) {print $i; exit}}' | cut -dx -f1 || true)
-  first_h=$(ffmpeg -v error -i "${files[0]}" -f null - 2>&1 | awk -F'[, ]+' '/, [0-9]+x[0-9]+/ { for(i=1;i<=NF;i++) if ($i ~ /[0-9]+x[0-9]+/) {print $i; exit}}' | cut -dx -f2 || true)
-  if [[ "$first_w" =~ ^[0-9]+$ && "$first_h" =~ ^[0-9]+$ && "$first_w" -gt 0 && "$first_h" -gt 0 ]]; then
-    if (( user_set_cell_w == 0 )); then cell_w="$first_w"; fi
-    if (( user_set_cell_h == 0 )); then cell_h="$first_h"; fi
-    echo "[INFO] Auto cell size from first image: ${cell_w}x${cell_h}"
-  else
-    echo "[WARN] Failed to probe first image size; keep default cell ${cell_w}x${cell_h}"
+# ------------------------------ Probe sizes ----------------------------------
+probe_img_wh() {
+  # Echo: "<w> <h>" (space separated), or empty on failure
+  local f="$1"
+  local wh=""
+  wh="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+        -of csv=p=0:s=' ' "$f" 2>/dev/null || true)"
+  if [[ -z "$wh" ]]; then
+    if command -v identify >/dev/null 2>&1; then
+      wh="$(identify -format '%w %h' "$f" 2>/dev/null || true)"
+    fi
   fi
-fi
+  echo "$wh"
+}
 
-# ------------------------------ Build filter graph ---------------------------
-ff_loglevel=info
-(( verbose == 0 )) && ff_loglevel=error
-
-filter_parts=()      # pieces of filter_complex joined by ';'
-in_opts=()           # repeated -i inputs
-layout_elems=()      # xstack layout strings x_y per tile
-
-for ((k=0; k<inputs_count; k++)); do
-  f="${files[$k]}"
-
-  # For images, feed them as 1-second looping videos so filters work uniformly.
-  # -loop 1: loop the image; -t 1: limit to 1 second; we will output a single frame.
-  in_opts+=( -loop 1 -t 1 -i "$f" )
-
-  vin="[${k}:v]"     # input label
-  vout="[vs$k]"      # preprocessed output label
-
-  # Choose per-cell fit mode
-  if [[ "$fit_mode" == "contain" ]]; then
-    # Keep AR, pad to cell size (may show borders)
-    vchain="$vin scale=${cell_w}:${cell_h}:force_original_aspect_ratio=decrease,pad=${cell_w}:${cell_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=rgba${vout}"
-  else
-    # Scale up to fill cell then center-crop (no borders, may crop edges)
-    vchain="$vin scale=${cell_w}:${cell_h}:force_original_aspect_ratio=increase,crop=${cell_w}:${cell_h},setsar=1,format=rgba${vout}"
+img_w=()
+img_h=()
+for f in "${files[@]}"; do
+  wh="$(probe_img_wh "$f")"
+  if [[ -z "$wh" ]]; then
+    echo "Error: probe size failed: $f" >&2
+    exit 1
   fi
-  filter_parts+=( "$vchain" )
-
-  # Compute position in the grid
-  row=$(( k / cols ))
-  col=$(( k % cols ))
-  x=$(( col * cell_w ))
-  y=$(( row * cell_h ))
-  layout_elems+=( "${x}_${y}" )
+  img_w+=( "${wh%% *}" )
+  img_h+=( "${wh##* }" )
 done
 
-# Compose the grid with xstack
-stack_out="[stackout]"
-if (( inputs_count == 1 )); then
-  # Single input: skip xstack
-  filter_parts+=( "[vs0]${stack_out}" )
-else
-  # Multiple inputs: feed all [vs*] into xstack explicitly
-  vouts_joined=""
-  for ((k=0; k<inputs_count; k++)); do
-    vouts_joined="${vouts_joined}[vs${k}]"
+# ------------------------------ Layout compute -------------------------------
+canvas_w=0
+canvas_h=0
+x_pos=()
+y_pos=()
+
+if [[ "$fit_mode" == "tight" ]]; then
+  # Row-wise: compute sum of widths and max height per row
+  row_sum_w=()
+  row_max_h=()
+  for ((r=0; r<rows; r++)); do
+    sum=0; maxh=0
+    for ((c=0; c<cols; c++)); do
+      idx=$(( r*cols + c ))
+      (( idx >= inputs_count )) && break
+      sum=$(( sum + img_w[idx] ))
+      (( img_h[idx] > maxh )) && maxh=${img_h[idx]}
+    done
+    # add gutters between cells in a row
+    used_cols=$(( idx >= inputs_count ? (inputs_count - r*cols) : cols ))
+    if (( used_cols > 1 )); then sum=$(( sum + gutter*(used_cols-1) )); fi
+    row_sum_w+=( "$sum" )
+    row_max_h+=( "$maxh" )
+    (( sum > canvas_w )) && canvas_w=$sum
   done
-  layout_joined=$(IFS='|'; echo "${layout_elems[*]}")
-  stack_filter="${vouts_joined}xstack=inputs=${inputs_count}:layout=${layout_joined}${stack_out}"
-  filter_parts+=( "$stack_filter" )
+  # total height with gutters between rows
+  for ((r=0; r<rows; r++)); do
+    canvas_h=$(( canvas_h + (row_max_h[r]) ))
+  done
+  if (( rows > 1 )); then canvas_h=$(( canvas_h + gutter*(rows-1) )); fi
+
+  # Now positions with per-row horizontal alignment
+  y=0
+  for ((r=0; r<rows; r++)); do
+    row_y=$y
+    # horizontal start x based on alignment
+    case "$align" in
+      left)   start_x=0 ;;
+      center) start_x=$(( (canvas_w - row_sum_w[r]) / 2 )) ;;
+      right)  start_x=$((  canvas_w - row_sum_w[r] )) ;;
+    esac
+    x=$start_x
+    for ((c=0; c<cols; c++)); do
+      idx=$(( r*cols + c ))
+      (( idx >= inputs_count )) && break
+      x_pos[idx]=$x; y_pos[idx]=$row_y
+      x=$(( x + img_w[idx] + gutter ))
+    done
+    y=$(( y + row_max_h[r] + gutter ))
+  done
+else
+  # contain/cover: uniform cell size
+  if (( user_set_cell_w == 0 || user_set_cell_h == 0 )); then
+    # If user didn't set, adopt FIRST image size as cell
+    cell_w=${img_w[0]}
+    cell_h=${img_h[0]}
+    echo "[INFO] Auto cell size from first image: ${cell_w}x${cell_h}"
+  fi
+  canvas_w=$(( cols*cell_w + gutter*(cols-1) ))
+  canvas_h=$(( rows*cell_h + gutter*(rows-1) ))
+
+  for ((k=0; k<inputs_count; k++)); do
+    r=$(( k / cols ))
+    c=$(( k % cols ))
+    base_x=$(( c*cell_w + gutter*c ))
+    base_y=$(( r*cell_h + gutter*r ))
+
+    if [[ "$fit_mode" == "contain" ]]; then
+      # Keep AR; compute scale result to place centered
+      # We will still use ffmpeg to scale/pad; here we only store the cell top-left.
+      x_pos[k]=$base_x; y_pos[k]=$base_y
+    else # cover
+      x_pos[k]=$base_x; y_pos[k]=$base_y
+    fi
+  done
 fi
 
-# Join all filter nodes
+# ------------------------------ BG color & source -----------------------------
+# Convert bg_color to ffmpeg "color" + alpha
+bg_ff="black"
+case "$bg_color" in
+  black)       bg_ff="black" ;;
+  white)       bg_ff="white" ;;
+  transparent) bg_ff="black@0" ;;   # transparent via 0 alpha
+  \#*)         bg_ff="${bg_color#\#}"; bg_ff="0x$bg_ff" ;;  # hex
+  *)           bg_ff="$bg_color" ;;
+esac
+
+# ------------------------------ Build filtergraph ----------------------------
+ff_loglevel=info; (( verbose == 0 )) && ff_loglevel=error
+
+# Inputs: first is a color canvas; then each image as a one-second loop
+in_opts=( -f lavfi -i "color=c=${bg_ff}:s=${canvas_w}x${canvas_h}:r=1,format=rgba" )
+for f in "${files[@]}"; do
+  in_opts+=( -loop 1 -t 1 -i "$f" )
+done
+
+# Prepare per-image preprocess labels
+filter_parts=()
+vlabels=()
+# Base is [0:v]
+base="[base0]"
+filter_parts+=( "[0:v]format=rgba${base}" )
+
+for ((k=0; k<inputs_count; k++)); do
+  vin="[$((k+1)):v]"
+  vout="[im$k]"
+
+  if [[ "$fit_mode" == "tight" ]]; then
+    # No scaling; ensure RGBA
+    filter_parts+=( "$vin format=rgba${vout}" )
+  elif [[ "$fit_mode" == "contain" ]]; then
+    # Scale inside cell, pad to exact cell size, then overlay at cell topleft
+    filter_parts+=( "$vin scale=${cell_w}:${cell_h}:force_original_aspect_ratio=decrease,\
+pad=${cell_w}:${cell_h}:(ow-iw)/2:(oh-ih)/2:color=${bg_ff},format=rgba${vout}" )
+  else
+    # cover: fill cell with possible crop
+    filter_parts+=( "$vin scale=${cell_w}:${cell_h}:force_original_aspect_ratio=increase,\
+crop=${cell_w}:${cell_h},format=rgba${vout}" )
+  fi
+done
+
+# Chain overlays: base + im0 -> base1, base1 + im1 -> base2, ...
+prev="$base"
+for ((k=0; k<inputs_count; k++)); do
+  next="[base$((k+1))]"
+  ox=${x_pos[$k]:-0}; oy=${y_pos[$k]:-0}
+  filter_parts+=( "${prev}[im$k]overlay=x=${ox}:y=${oy}:format=auto${next}" )
+  prev="$next"
+done
+
+final_label="$prev"
 filter_complex=$(IFS=';'; echo "${filter_parts[*]}")
 
 # ------------------------------ Build command --------------------------------
-# Output a single PNG frame from the stacked stream.
 cmd=( ffmpeg -v "$ff_loglevel" -y )
 cmd+=( "${in_opts[@]}" )
 cmd+=( -filter_complex "$filter_complex" )
-cmd+=( -map "$stack_out" -frames:v 1 -f image2 -pix_fmt rgba "$output_png" )
+cmd+=( -map "$final_label" -frames:v 1 -f image2 -pix_fmt rgba "$output_png" )
 
-echo "[INFO] Grid: ${rows}x${cols}  Inputs: ${inputs_count}  Cell: ${cell_w}x${cell_h}  Fit: ${fit_mode}"
+echo "[INFO] Mode=${fit_mode}  Align=${align}  Gutter=${gutter}  BG=${bg_color}"
+echo "[INFO] Canvas=${canvas_w}x${canvas_h}  Grid=${rows}x${cols}  Inputs=${inputs_count}"
 echo "[INFO] Output: ${output_png}"
 if (( verbose == 1 )); then
-  echo "[INFO] Running ffmpeg command:"
-  printf ' %q' "${cmd[@]}"; echo
+  echo "[INFO] Running ffmpeg command:"; printf ' %q' "${cmd[@]}"; echo
 fi
 
 "${cmd[@]}"
